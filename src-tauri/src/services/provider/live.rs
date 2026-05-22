@@ -1442,7 +1442,7 @@ pub fn import_hermes_providers_from_live(state: &AppState) -> Result<usize, AppE
         // Create provider
         let mut provider = Provider::with_id(name.clone(), name.clone(), config, None);
         provider.meta = Some(crate::provider::ProviderMeta {
-            live_config_managed: Some(true),
+            live_config_managed: Some(false),
             ..Default::default()
         });
 

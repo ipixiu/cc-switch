@@ -30,7 +30,7 @@
 //!     args: ["-y", "@modelcontextprotocol/server-filesystem"]
 //! ```
 
-use crate::config::{atomic_write, get_app_config_dir};
+use crate::config::{atomic_write, get_app_config_dir, write_text_file};
 use crate::error::AppError;
 use crate::settings::{effective_backup_retain_count, get_hermes_override_dir};
 use chrono::Local;
@@ -63,9 +63,67 @@ pub fn get_hermes_config_path() -> PathBuf {
     get_hermes_dir().join("config.yaml")
 }
 
+/// 获取 Hermes .env 文件路径
+pub fn get_hermes_env_path() -> PathBuf {
+    get_hermes_dir().join(".env")
+}
+
 fn hermes_write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// 解析 .env 文件内容为键值对（宽松模式）
+pub fn parse_env_file(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                map.insert(key, value);
+            }
+        }
+    }
+
+    map
+}
+
+pub fn serialize_env_file(map: &HashMap<String, String>) -> String {
+    let mut lines = Vec::new();
+    let mut keys: Vec<_> = map.keys().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(value) = map.get(key) {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn read_hermes_env() -> Result<HashMap<String, String>, AppError> {
+    let path = get_hermes_env_path();
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
+    Ok(parse_env_file(&content))
+}
+
+pub fn write_hermes_env_atomic(map: &HashMap<String, String>) -> Result<(), AppError> {
+    let path = get_hermes_env_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
+    }
+    let content = serialize_env_file(map);
+    write_text_file(&path, &content)?;
+    Ok(())
 }
 
 // ============================================================================
@@ -410,7 +468,8 @@ fn write_yaml_section_to_config_locked(
     };
 
     let sanitized_raw = dedupe_top_level_yaml_sections(&raw).unwrap_or_else(|| raw.clone());
-    let new_raw = replace_yaml_section(&sanitized_raw, section_key, value)?;
+    let replaced_raw = replace_yaml_section(&sanitized_raw, section_key, value)?;
+    let new_raw = dedupe_top_level_yaml_sections(&replaced_raw).unwrap_or(replaced_raw);
 
     if new_raw == raw {
         return Ok(HermesWriteOutcome::default());
@@ -568,6 +627,83 @@ fn denormalize_provider_models_for_read(config: &mut serde_json::Value) {
     }
 }
 
+fn infer_hermes_env_key(name: &str, config: &serde_json::Value) -> Option<String> {
+    if let Some(existing) = config.get("key_env").and_then(|value| value.as_str()) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let api_mode = config
+        .get("api_mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let suffix = if api_mode == "codex_responses" {
+        "API_KEY"
+    } else {
+        "AUTH_TOKEN"
+    };
+
+    let sanitized = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    let normalized = sanitized
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(format!("HERMES_CC_{normalized}_{suffix}"))
+}
+
+fn sync_hermes_provider_secret_to_env(
+    provider_name: &str,
+    config: &mut serde_json::Value,
+) -> Result<(), AppError> {
+    let key_env = infer_hermes_env_key(provider_name, config);
+
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(());
+    };
+
+    let api_key = obj
+        .get("api_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    match (api_key, key_env) {
+        (Some(api_key), Some(key_env)) => {
+            let mut env_map = read_hermes_env()?;
+            env_map.insert(key_env.clone(), api_key);
+            write_hermes_env_atomic(&env_map)?;
+            obj.insert("key_env".to_string(), serde_json::json!(key_env));
+        }
+        (None, Some(key_env)) => {
+            if let Some(existing) = read_hermes_env()?.get(&key_env).cloned() {
+                obj.insert("api_key".to_string(), serde_json::json!(existing));
+                obj.insert("key_env".to_string(), serde_json::json!(key_env));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Marker field injected on provider payloads sourced from Hermes v12+
 /// `providers:` dict. CC Switch treats those as read-only — writes have to
 /// go through Hermes' own Web UI to keep its overlay semantics intact.
@@ -665,6 +801,11 @@ pub fn get_providers() -> Result<serde_json::Map<String, serde_json::Value>, App
                         // imports) before the UI sees them, so editing doesn't
                         // reveal stale `baseUrl` / `apiKey` fields.
                         sanitize_hermes_provider_keys(&mut json_val);
+                        if let Err(e) = sync_hermes_provider_secret_to_env(name, &mut json_val) {
+                            log::warn!(
+                                "Failed to sync Hermes provider '{name}' secret from env: {e}"
+                            );
+                        }
                         denormalize_provider_models_for_read(&mut json_val);
                         if let Some(obj) = json_val.as_object_mut() {
                             obj.insert(
@@ -685,6 +826,9 @@ pub fn get_providers() -> Result<serde_json::Map<String, serde_json::Value>, App
     for (name, mut entry) in read_providers_dict_entries(&config) {
         if map.contains_key(&name) {
             continue; // list wins over dict on duplicate names
+        }
+        if let Err(e) = sync_hermes_provider_secret_to_env(&name, &mut entry) {
+            log::warn!("Failed to sync Hermes provider '{name}' secret from env: {e}");
         }
         denormalize_provider_models_for_read(&mut entry);
         map.insert(name, entry);
@@ -777,6 +921,7 @@ pub fn set_provider(
     // before touching models / YAML — avoids writing non-Hermes fields back.
     let mut normalized = provider_config;
     sanitize_hermes_provider_keys(&mut normalized);
+    sync_hermes_provider_secret_to_env(name, &mut normalized)?;
 
     // Normalize `models` from UI array to Hermes YAML dict before serializing.
     normalize_provider_models_for_write(&mut normalized);
@@ -1820,6 +1965,61 @@ custom_providers:
 
     #[test]
     #[serial]
+    fn set_provider_persists_api_key_into_hermes_env() {
+        with_test_home(|| {
+            let input = serde_json::json!({
+                "base_url": "https://api.example.com/v1",
+                "api_key": "sk-secret",
+                "api_mode": "anthropic_messages",
+                "models": [{ "id": "model-a" }]
+            });
+            set_provider("demo", input).unwrap();
+
+            let env = read_hermes_env().unwrap();
+            assert_eq!(env.get("HERMES_CC_DEMO_AUTH_TOKEN"), Some(&"sk-secret".to_string()));
+
+            let provider = get_provider("demo").unwrap().unwrap();
+            assert_eq!(
+                provider.get("key_env").and_then(|value| value.as_str()),
+                Some("HERMES_CC_DEMO_AUTH_TOKEN")
+            );
+            assert_eq!(
+                provider.get("api_key").and_then(|value| value.as_str()),
+                Some("sk-secret")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn get_providers_backfills_api_key_from_key_env() {
+        with_test_home(|| {
+            let config_path = get_hermes_config_path();
+            fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            fs::write(
+                &config_path,
+                "\
+custom_providers:
+  - name: demo
+    base_url: https://api.example.com/v1
+    key_env: HERMES_CC_DEMO_AUTH_TOKEN
+    api_mode: anthropic_messages
+",
+            )
+            .unwrap();
+            let env_path = get_hermes_env_path();
+            fs::write(&env_path, "HERMES_CC_DEMO_AUTH_TOKEN=sk-from-env\n").unwrap();
+
+            let provider = get_provider("demo").unwrap().unwrap();
+            assert_eq!(
+                provider.get("api_key").and_then(|value| value.as_str()),
+                Some("sk-from-env")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn provider_without_models_is_unaffected() {
         with_test_home(|| {
             let input = serde_json::json!({
@@ -2019,6 +2219,44 @@ custom_providers:
             assert!(raw.contains("default: fresh-model"));
             assert!(raw.contains("provider: fresh-provider"));
             assert!(raw.contains("agent:"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn set_provider_rewrites_duplicate_custom_providers_section() {
+        with_test_home(|| {
+            let yaml = "\
+model:
+  default: stale-model
+  provider: stale-provider
+custom_providers:
+  - name: stale
+custom_providers:
+  - name: duplicate
+";
+            fs::write(get_hermes_config_path(), yaml).unwrap();
+
+            let config = serde_json::json!({
+                "base_url": "https://api.example.com/v1",
+                "key_env": "EXAMPLE_KEY",
+                "api_mode": "anthropic_messages",
+                "models": [{ "id": "fresh-model" }]
+            });
+            set_provider("fresh", config).unwrap();
+
+            let raw = fs::read_to_string(get_hermes_config_path()).unwrap();
+            let sections = collect_top_level_yaml_sections(&raw);
+            assert_eq!(
+                sections
+                    .iter()
+                    .filter(|section| section.key == "custom_providers")
+                    .count(),
+                1
+            );
+            assert!(raw.contains("name: fresh"));
+            assert!(!raw.contains("name: duplicate"));
+            assert!(!raw.contains("name: stale"));
         });
     }
 

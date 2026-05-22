@@ -1036,6 +1036,27 @@ impl ProviderService {
         Self::validate_provider_settings(&app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
         if app_type.is_additive_mode() {
+            if matches!(app_type, AppType::Hermes) {
+                if provider
+                    .settings_config
+                    .get("api_key")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .is_none_or(|value| value.is_empty())
+                    && provider
+                        .settings_config
+                        .get("key_env")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .is_none_or(|value| value.is_empty())
+                {
+                    return Err(AppError::localized(
+                        "provider.hermes.api_key.missing",
+                        "Hermes 供应商缺少 API Key",
+                        "Hermes provider is missing API key",
+                    ));
+                }
+            }
             Self::set_provider_live_config_managed(&mut provider, add_to_live);
         }
 
