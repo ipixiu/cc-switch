@@ -116,8 +116,27 @@ pub fn read_hermes_config() -> Result<serde_yaml::Value, AppError> {
         return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
     }
 
-    serde_yaml::from_str(&content)
-        .map_err(|e| AppError::Config(format!("Failed to parse Hermes config as YAML: {e}")))
+    match serde_yaml::from_str(&content) {
+        Ok(config) => Ok(config),
+        Err(parse_err) => {
+            if parse_err.to_string().contains("duplicate entry with key") {
+                if let Some(sanitized) = dedupe_top_level_yaml_sections(&content) {
+                    if let Ok(config) = serde_yaml::from_str(&sanitized) {
+                        log::warn!(
+                            "Hermes config at {:?} contains duplicate top-level sections; \
+                             parsing a sanitized in-memory copy that keeps the last section",
+                            path
+                        );
+                        return Ok(config);
+                    }
+                }
+            }
+
+            Err(AppError::Config(format!(
+                "Failed to parse Hermes config as YAML: {parse_err}"
+            )))
+        }
+    }
 }
 
 // ============================================================================
@@ -179,6 +198,83 @@ fn find_yaml_section_range(raw: &str, section_key: &str) -> Option<(usize, usize
 
     // Section extends to end of file
     section_start.map(|start| (start, raw.len()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YamlTopLevelSection {
+    key: String,
+    start: usize,
+    end: usize,
+}
+
+fn top_level_key_name(line: &str) -> Option<&str> {
+    if !is_top_level_key_line(line) {
+        return None;
+    }
+    line.find(':').map(|colon_pos| &line[..colon_pos])
+}
+
+fn collect_top_level_yaml_sections(raw: &str) -> Vec<YamlTopLevelSection> {
+    let mut sections = Vec::new();
+    let mut current: Option<(String, usize)> = None;
+    let mut offset = 0;
+
+    for line in raw.split('\n') {
+        if let Some(key) = top_level_key_name(line) {
+            if let Some((prev_key, start)) = current.replace((key.to_string(), offset)) {
+                sections.push(YamlTopLevelSection {
+                    key: prev_key,
+                    start,
+                    end: offset,
+                });
+            }
+        }
+        offset += line.len() + 1; // +1 for the \n
+    }
+
+    if let Some((key, start)) = current {
+        sections.push(YamlTopLevelSection {
+            key,
+            start,
+            end: raw.len(),
+        });
+    }
+
+    sections
+}
+
+/// Remove duplicate top-level YAML sections while keeping the last occurrence
+/// of each key so later writes win over stale earlier copies.
+fn dedupe_top_level_yaml_sections(raw: &str) -> Option<String> {
+    let sections = collect_top_level_yaml_sections(raw);
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut last_index_by_key = HashMap::new();
+    for (idx, section) in sections.iter().enumerate() {
+        last_index_by_key.insert(section.key.clone(), idx);
+    }
+
+    let mut remove_ranges = Vec::new();
+    for (idx, section) in sections.iter().enumerate() {
+        if last_index_by_key.get(&section.key).copied() != Some(idx) {
+            remove_ranges.push((section.start, section.end));
+        }
+    }
+
+    if remove_ranges.is_empty() {
+        return None;
+    }
+
+    let mut result = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    for (start, end) in remove_ranges {
+        result.push_str(&raw[cursor..start]);
+        cursor = end;
+    }
+    result.push_str(&raw[cursor..]);
+    Some(result)
 }
 
 /// Serialize a section key + value into a YAML fragment like:
@@ -313,7 +409,8 @@ fn write_yaml_section_to_config_locked(
         String::new()
     };
 
-    let new_raw = replace_yaml_section(&raw, section_key, value)?;
+    let sanitized_raw = dedupe_top_level_yaml_sections(&raw).unwrap_or_else(|| raw.clone());
+    let new_raw = replace_yaml_section(&sanitized_raw, section_key, value)?;
 
     if new_raw == raw {
         return Ok(HermesWriteOutcome::default());
@@ -1204,6 +1301,43 @@ model:
         assert!(!section.starts_with("model_extra:"));
     }
 
+    #[test]
+    fn dedupe_top_level_yaml_sections_keeps_last_duplicate() {
+        let yaml = "\
+model:
+  default: old-model
+agent:
+  max_turns: 10
+custom_providers:
+  - name: stale
+model:
+  default: new-model
+custom_providers:
+  - name: fresh
+";
+        let result = dedupe_top_level_yaml_sections(yaml).unwrap();
+        let sections = collect_top_level_yaml_sections(&result);
+        assert_eq!(
+            sections
+                .iter()
+                .filter(|section| section.key == "model")
+                .count(),
+            1
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .filter(|section| section.key == "custom_providers")
+                .count(),
+            1
+        );
+        assert!(result.contains("default: new-model"));
+        assert!(!result.contains("default: old-model"));
+        assert!(result.contains("- name: fresh"));
+        assert!(!result.contains("- name: stale"));
+        assert!(result.contains("agent:"));
+    }
+
     // ---- replace_yaml_section tests ----
 
     #[test]
@@ -1806,6 +1940,85 @@ custom_providers:
             // First entry's id is whitespace-only → blank → fall back to old default
             // (we intentionally don't scan past the first entry for a default).
             assert_eq!(model.default.as_deref(), Some("prev-default"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn read_hermes_config_heals_duplicate_top_level_sections() {
+        with_test_home(|| {
+            let yaml = "\
+model:
+  default: stale-model
+  provider: stale-provider
+custom_providers:
+  - name: stale
+agent:
+  max_turns: 10
+model:
+  default: healed-model
+  provider: healed-provider
+custom_providers:
+  - name: healed
+";
+            fs::write(get_hermes_config_path(), yaml).unwrap();
+
+            let model = get_model_config().unwrap().unwrap();
+            assert_eq!(model.default.as_deref(), Some("healed-model"));
+            assert_eq!(model.provider.as_deref(), Some("healed-provider"));
+
+            let providers = get_providers().unwrap();
+            assert!(providers.contains_key("healed"));
+            assert!(!providers.contains_key("stale"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn set_model_config_rewrites_duplicate_top_level_sections() {
+        with_test_home(|| {
+            let yaml = "\
+model:
+  default: stale-model
+  provider: stale-provider
+agent:
+  max_turns: 10
+custom_providers:
+  - name: stale
+model:
+  default: duplicate-model
+  provider: duplicate-provider
+custom_providers:
+  - name: duplicate
+";
+            fs::write(get_hermes_config_path(), yaml).unwrap();
+
+            let updated = HermesModelConfig {
+                default: Some("fresh-model".to_string()),
+                provider: Some("fresh-provider".to_string()),
+                ..Default::default()
+            };
+            set_model_config(&updated).unwrap();
+
+            let raw = fs::read_to_string(get_hermes_config_path()).unwrap();
+            let sections = collect_top_level_yaml_sections(&raw);
+            assert_eq!(
+                sections
+                    .iter()
+                    .filter(|section| section.key == "model")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                sections
+                    .iter()
+                    .filter(|section| section.key == "custom_providers")
+                    .count(),
+                1
+            );
+            assert!(raw.contains("default: fresh-model"));
+            assert!(raw.contains("provider: fresh-provider"));
+            assert!(raw.contains("agent:"));
         });
     }
 
